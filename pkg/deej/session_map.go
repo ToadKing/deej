@@ -16,8 +16,9 @@ type sessionMap struct {
 	deej   *Deej
 	logger *zap.SugaredLogger
 
-	m    map[string][]Session
-	lock sync.Locker
+	m       map[string][]Session
+	special map[string][]Session
+	lock    sync.Locker
 
 	sessionFinder SessionFinder
 
@@ -39,6 +40,9 @@ const (
 
 	// targets all currently unmapped sessions (experimental)
 	specialTargetAllUnmapped = "unmapped"
+
+	// special target for sending HTTP requests instead of changing audio directly (experimental)
+	specialTargetHttp = "http"
 
 	// this threshold constant assumes that re-acquiring all sessions is a kind of expensive operation,
 	// and needs to be limited in some manner. this value was previously user-configurable through a config
@@ -64,6 +68,7 @@ func newSessionMap(deej *Deej, logger *zap.SugaredLogger, sessionFinder SessionF
 		deej:          deej,
 		logger:        logger,
 		m:             make(map[string][]Session),
+		special:       make(map[string][]Session),
 		lock:          &sync.Mutex{},
 		sessionFinder: sessionFinder,
 	}
@@ -78,6 +83,8 @@ func (m *sessionMap) initialize() error {
 		m.logger.Warnw("Failed to get all sessions during session map initialization", "error", err)
 		return fmt.Errorf("get all sessions during init: %w", err)
 	}
+
+	m.createSpecialSessions()
 
 	m.setupOnConfigReload()
 	m.setupOnSliderMove()
@@ -122,16 +129,37 @@ func (m *sessionMap) getAndAddSessions() error {
 	return nil
 }
 
+func (m *sessionMap) createSpecialSessions() {
+	m.clearSpecial()
+
+	m.deej.config.SliderMapping.iterate(func(sliderIdx int, targets []string) {
+		for _, target := range targets {
+			if !m.targetHasSpecialTransform(target) {
+				continue
+			}
+
+			targetAndParams := strings.Fields(strings.TrimPrefix(target, specialTargetTransformPrefix))
+			switch targetAndParams[0] {
+			case specialTargetHttp:
+				session, err := newHTTPSession(m.logger, targetAndParams[1:])
+				if err != nil {
+					m.logger.Errorw("error creating http session", "session", err)
+				} else {
+					m.addSpecial(session)
+				}
+			}
+		}
+	})
+}
+
 func (m *sessionMap) setupOnConfigReload() {
 	configReloadedChannel := m.deej.config.SubscribeToChanges()
 
 	go func() {
-		for {
-			select {
-			case <-configReloadedChannel:
-				m.logger.Info("Detected config reload, attempting to re-acquire all audio sessions")
-				m.refreshSessions(false)
-			}
+		for range configReloadedChannel {
+			m.logger.Info("Detected config reload, attempting to re-acquire all audio sessions")
+			m.refreshSessions(false)
+			m.createSpecialSessions()
 		}
 	}()
 }
@@ -140,11 +168,8 @@ func (m *sessionMap) setupOnSliderMove() {
 	sliderEventsChannel := m.deej.serial.SubscribeToSliderMoveEvents()
 
 	go func() {
-		for {
-			select {
-			case event := <-sliderEventsChannel:
-				m.handleSliderMoveEvent(event)
-			}
+		for event := range sliderEventsChannel {
+			m.handleSliderMoveEvent(event)
 		}
 	}()
 }
@@ -165,6 +190,22 @@ func (m *sessionMap) refreshSessions(force bool) {
 	} else {
 		m.logger.Debug("Re-acquired sessions successfully")
 	}
+
+	// create special sessions
+
+	m.deej.config.SliderMapping.iterate(func(sliderIdx int, targets []string) {
+		for _, target := range targets {
+			if !m.targetHasSpecialTransform(target) {
+				continue
+			}
+
+			targetAndParams := strings.Fields(strings.TrimPrefix(target, specialTargetTransformPrefix))
+			switch targetAndParams[0] {
+			case specialTargetHttp:
+
+			}
+		}
+	})
 }
 
 // returns true if a session is not currently mapped to any slider, false otherwise
@@ -276,10 +317,6 @@ func (m *sessionMap) targetHasSpecialTransform(target string) bool {
 }
 
 func (m *sessionMap) resolveTarget(target string) []string {
-
-	// start by ignoring the case
-	target = strings.ToLower(target)
-
 	// look for any special targets first, by examining the prefix
 	if m.targetHasSpecialTransform(target) {
 		return m.applyTargetTransform(strings.TrimPrefix(target, specialTargetTransformPrefix))
@@ -291,7 +328,8 @@ func (m *sessionMap) resolveTarget(target string) []string {
 func (m *sessionMap) applyTargetTransform(specialTargetName string) []string {
 
 	// select the transformation based on its name
-	switch specialTargetName {
+	targetAndParams := strings.Fields(specialTargetName)
+	switch targetAndParams[0] {
 
 	// get current active window
 	case specialTargetCurrentWindow:
@@ -318,6 +356,13 @@ func (m *sessionMap) applyTargetTransform(specialTargetName string) []string {
 		}
 
 		return targetKeys
+
+	case specialTargetHttp:
+		if len(targetAndParams) == 3 {
+			return []string{httpParamsToKey(targetAndParams[1], targetAndParams[2])}
+		} else {
+			return nil
+		}
 	}
 
 	return nil
@@ -337,12 +382,24 @@ func (m *sessionMap) add(value Session) {
 	}
 }
 
+func (m *sessionMap) addSpecial(value Session) {
+	key := value.Key()
+
+	existing, ok := m.m[key]
+	if !ok {
+		m.special[key] = []Session{value}
+	} else {
+		m.special[key] = append(existing, value)
+	}
+}
+
 func (m *sessionMap) get(key string) ([]Session, bool) {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
 	value, ok := m.m[key]
-	return value, ok
+	specialValue, specialOk := m.special[key]
+	return append(value, specialValue...), ok || specialOk
 }
 
 func (m *sessionMap) clear() {
@@ -360,6 +417,23 @@ func (m *sessionMap) clear() {
 	}
 
 	m.logger.Debug("Session map cleared")
+}
+
+func (m *sessionMap) clearSpecial() {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	m.logger.Debug("Releasing and clearing all special sessions")
+
+	for key, sessions := range m.special {
+		for _, session := range sessions {
+			session.Release()
+		}
+
+		delete(m.special, key)
+	}
+
+	m.logger.Debug("Special session map cleared")
 }
 
 func (m *sessionMap) String() string {
